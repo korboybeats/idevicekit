@@ -21,8 +21,15 @@ public class InstallationProxy: Identifiable, ObservableObject {
 	@ObservedObject
 	public var viewModel: InstallerStatusViewModel
 	
-	public init(viewModel: InstallerStatusViewModel) {
+	private let _diagnosticLog: @Sendable (String) -> Void
+
+	public init(viewModel: InstallerStatusViewModel, diagnosticLog: @escaping @Sendable (String) -> Void = { NSLog("%@", $0) }) {
 		self.viewModel = viewModel
+		self._diagnosticLog = diagnosticLog
+	}
+
+	private func _log(_ message: String) {
+		_diagnosticLog("attempt=\(_uuid) \(message)")
 	}
 	
 	public func install(at url: URL, suspend: Bool = false) async throws {
@@ -31,6 +38,12 @@ public class InstallationProxy: Identifiable, ObservableObject {
 		var installproxy: InstallationProxyClientHandle?
 		
 		try await Task.detached(priority: .utility) {
+			let attemptStarted = ProcessInfo.processInfo.systemUptime
+			var phase = "connection"
+			self._log("diagnostics=5 transport=jktcp-0.1.7-nodelay-tlsfix phase=connection started")
+			defer {
+				self._log("attempt ended phase=\(phase) elapsed=\(ProcessInfo.processInfo.systemUptime - attemptStarted)s")
+			}
 			guard FileManager.default.fileExists(atPath: HeartbeatManager.pairingFile()) else {
 				throw IDeviceSwiftError(message: "Missing Pairing")
 			}
@@ -92,37 +105,65 @@ public class InstallationProxy: Identifiable, ObservableObject {
 			
 			print("2")
 			
+			phase = "payload"
+			self._log("phase=payload started")
 			try await self._updateStatus(with: .sendingPayload)
 			
 			guard let fileHandle = fileHandle else {
 				throw IDeviceSwiftError(message: "Missing File Handle")
 			}
 			
-			let data = try Data(contentsOf: url)
-			let totalSize = data.count
-			let chunkSize = 64 * 1024 * 1024 // 67mb
-			var totalBytesWritten = 0
-			
-			guard let rawBuffer = data.withUnsafeBytes({ $0.baseAddress })?.assumingMemoryBound(to: UInt8.self) else {
-				throw IDeviceSwiftError(message: "Error writing to AFC")
-			}
-			
-			while totalBytesWritten < totalSize {
-				let bytesLeft = totalSize - totalBytesWritten
-				let bytesToWrite = min(chunkSize, bytesLeft)
-				let writePtr = rawBuffer.advanced(by: totalBytesWritten)
-				
-				let result = afc_file_write(fileHandle, writePtr, bytesToWrite)
-				if result != nil {
-					throw IDeviceSwiftError(result)
+			do {
+				let input = try FileHandle(forReadingFrom: url)
+				defer { try? input.close() }
+				let totalSize = try input.seekToEnd()
+				try input.seek(toOffset: 0)
+				guard totalSize > 0 else {
+					throw IDeviceSwiftError(message: "IPA is empty")
 				}
-				
-				totalBytesWritten += bytesToWrite
-				
-				let progress = Double(totalBytesWritten) / Double(totalSize)
-				try await self._updateUploadProgress(with: progress)
+				// The sliding-window transport drains a queue without cloning its remainder.
+				// Match AFC's maximum write size to avoid extra service round trips.
+				let chunkSize = 1024 * 1024
+				self._log("payload writeBytes=\(chunkSize) totalBytes=\(totalSize)")
+				var totalBytesWritten: UInt64 = 0
+				let started = ProcessInfo.processInfo.systemUptime
+				var readSeconds = 0.0
+				var writeSeconds = 0.0
+				var lastLog = started
+				var lastProgress = started
+				defer {
+					let elapsed = ProcessInfo.processInfo.systemUptime - started
+					self._log(String(format: "KorSign payload: bytes=%llu/%llu elapsed=%.3fs read=%.3fs AFC=%.3fs rate=%.2f MiB/s", totalBytesWritten, totalSize, elapsed, readSeconds, writeSeconds, Double(totalBytesWritten) / 1048576 / max(elapsed, 0.001)))
+				}
+				while totalBytesWritten < totalSize {
+					try Task.checkCancellation()
+					let readStart = ProcessInfo.processInfo.systemUptime
+					guard let chunk = try input.read(upToCount: Int(min(UInt64(chunkSize), totalSize - totalBytesWritten))), !chunk.isEmpty else {
+						throw IDeviceSwiftError(message: "IPA ended before upload completed")
+					}
+					readSeconds += ProcessInfo.processInfo.systemUptime - readStart
+					let writeStart = ProcessInfo.processInfo.systemUptime
+					// The pointer must remain inside withUnsafeBytes for the entire FFI call.
+					let result = chunk.withUnsafeBytes { buffer in
+						afc_file_write(fileHandle, buffer.bindMemory(to: UInt8.self).baseAddress!, chunk.count)
+					}
+					writeSeconds += ProcessInfo.processInfo.systemUptime - writeStart
+					if result != nil {
+						throw IDeviceSwiftError(result)
+					}
+					totalBytesWritten += UInt64(chunk.count)
+					let now = ProcessInfo.processInfo.systemUptime
+					if now - lastProgress >= 0.1 || totalBytesWritten == totalSize {
+						try await self._updateUploadProgress(with: Double(totalBytesWritten) / Double(totalSize))
+						lastProgress = now
+					}
+					if now - lastLog >= 5 {
+						self._log(String(format: "KorSign payload progress: bytes=%llu/%llu read=%.3fs AFC=%.3fs", totalBytesWritten, totalSize, readSeconds, writeSeconds))
+						lastLog = now
+					}
+				}
 			}
-			
+
 			print(2)
 			
 			let afc_file_close_result = afc_file_close(fileHandle)
@@ -130,6 +171,8 @@ public class InstallationProxy: Identifiable, ObservableObject {
 				throw IDeviceSwiftError(afc_file_close_result)
 			}
 			
+			phase = "installing"
+			self._log("phase=installing started")
 			try await self._updateStatus(with: .installing)
 			
 			
@@ -183,6 +226,8 @@ public class InstallationProxy: Identifiable, ObservableObject {
 			}
 			
 			try await Task.sleep(nanoseconds: 350_000_000)
+			phase = "completed"
+			self._log("phase=completed")
 			try await self._updateStatus(with: .completed(.success(())))
 		}.value
 	}
